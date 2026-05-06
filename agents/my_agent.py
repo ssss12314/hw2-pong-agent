@@ -1,7 +1,8 @@
 """Improved DQN agent for Atari Pong.
 
-This agent keeps the public homework interface while adding a dueling network,
-Double DQN targets, cropped Pong preprocessing, and CUDA/CPU device selection.
+This agent keeps the public homework interface while adding a visual Pong
+tracker, a dueling network, Double DQN targets, cropped preprocessing, and
+CUDA/CPU device selection.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import random
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Iterable, NamedTuple
+from typing import Any, Deque, Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -45,6 +46,176 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+@dataclass
+class VisionObservation:
+    ball: tuple[float, float] | None
+    left_paddle_y: float | None
+    right_paddle_y: float | None
+    width: int
+    height: int
+
+
+class VisionTracker:
+    """Small Pong-specific tracker used as a policy prior during evaluation."""
+
+    def __init__(self, move_down_action: int = 2, move_up_action: int = 3):
+        self.move_down_action = move_down_action
+        self.move_up_action = move_up_action
+        self.previous: VisionObservation | None = None
+        self.previous_action: int | None = None
+        self.control_scores = {"left": 0.0, "right": 0.0}
+        self.controlled_side: Literal["left", "right"] | None = None
+
+    def reset(self) -> None:
+        self.previous = None
+        self.previous_action = None
+        self.control_scores = {"left": 0.0, "right": 0.0}
+        self.controlled_side = None
+
+    def observe(self, observation) -> VisionObservation:
+        current = self._detect(observation)
+        self._update_controlled_side(current)
+        return current
+
+    def choose_action(self, current: VisionObservation) -> int | None:
+        if current.ball is None:
+            return None
+
+        side = self.controlled_side or self._side_ball_is_approaching(current)
+        paddle_y = current.left_paddle_y if side == "left" else current.right_paddle_y
+        if paddle_y is None:
+            paddle_y = current.right_paddle_y if current.right_paddle_y is not None else current.left_paddle_y
+        if paddle_y is None:
+            return None
+
+        target_y = self._intercept_y(current, side)
+        deadzone = 4.0
+        if paddle_y < target_y - deadzone:
+            return self.move_down_action
+        if paddle_y > target_y + deadzone:
+            return self.move_up_action
+        return 0
+
+    def remember_action(self, action: int, current: VisionObservation) -> None:
+        self.previous = current
+        self.previous_action = action
+
+    def _update_controlled_side(self, current: VisionObservation) -> None:
+        if self.previous is None or self.previous_action is None:
+            return
+        expected = self._action_direction(self.previous_action)
+        if expected == 0:
+            return
+        for side, attr in (("left", "left_paddle_y"), ("right", "right_paddle_y")):
+            before = getattr(self.previous, attr)
+            after = getattr(current, attr)
+            if before is None or after is None:
+                continue
+            delta = after - before
+            if abs(delta) < 0.5:
+                continue
+            self.control_scores[side] += expected * np.sign(delta)
+        if abs(self.control_scores["left"] - self.control_scores["right"]) >= 2.0:
+            self.controlled_side = "left" if self.control_scores["left"] > self.control_scores["right"] else "right"
+
+    def _intercept_y(self, current: VisionObservation, side: Literal["left", "right"]) -> float:
+        ball_x, ball_y = current.ball if current.ball is not None else (current.width / 2.0, current.height / 2.0)
+        if self.previous is None or self.previous.ball is None:
+            return ball_y
+        prev_x, prev_y = self.previous.ball
+        vx = ball_x - prev_x
+        vy = ball_y - prev_y
+        target_x = 12.0 if side == "left" else current.width - 12.0
+        if abs(vx) < 0.1 or (side == "left" and vx > 0) or (side == "right" and vx < 0):
+            return ball_y
+        projected_y = ball_y + vy * ((target_x - ball_x) / vx)
+        return self._reflect(projected_y, current.height - 1)
+
+    @staticmethod
+    def _reflect(y: float, bottom: int) -> float:
+        if bottom <= 0:
+            return y
+        period = 2.0 * bottom
+        folded = y % period
+        if folded > bottom:
+            folded = period - folded
+        return float(np.clip(folded, 0.0, bottom))
+
+    def _side_ball_is_approaching(self, current: VisionObservation) -> Literal["left", "right"]:
+        if self.previous is not None and self.previous.ball is not None and current.ball is not None:
+            return "left" if current.ball[0] < self.previous.ball[0] else "right"
+        return "right"
+
+    def _action_direction(self, action: int) -> int:
+        if action in (self.move_down_action, 4):
+            return 1
+        if action in (self.move_up_action, 5):
+            return -1
+        return 0
+
+    def _detect(self, observation) -> VisionObservation:
+        gray = MyAgent._observation_to_grayscale(observation)
+        crop = gray[34:194, :] if gray.shape[0] >= 194 else gray
+        mask = crop > 90
+        height, width = crop.shape
+        left_y = self._detect_paddle_y(mask, 0, max(1, width // 4))
+        right_y = self._detect_paddle_y(mask, min(width - 1, 3 * width // 4), width)
+        ball = self._detect_ball(mask)
+        return VisionObservation(ball=ball, left_paddle_y=left_y, right_paddle_y=right_y, width=width, height=height)
+
+    @staticmethod
+    def _detect_paddle_y(mask: np.ndarray, start_x: int, end_x: int) -> float | None:
+        region = mask[:, start_x:end_x]
+        if region.size == 0:
+            return None
+        column_counts = region.sum(axis=0)
+        active_columns = np.flatnonzero(column_counts >= 6)
+        if active_columns.size == 0:
+            return None
+        ys, xs = np.nonzero(region[:, active_columns])
+        if ys.size == 0:
+            return None
+        return float(np.median(ys))
+
+    @staticmethod
+    def _detect_ball(mask: np.ndarray) -> tuple[float, float] | None:
+        height, width = mask.shape
+        work = mask.copy()
+        work[:, : max(1, width // 8)] = False
+        work[:, min(width - 1, 7 * width // 8) :] = False
+        visited = np.zeros_like(work, dtype=bool)
+        best: tuple[float, float] | None = None
+        best_score = float("inf")
+
+        for y0, x0 in zip(*np.nonzero(work)):
+            if visited[y0, x0]:
+                continue
+            stack = [(int(y0), int(x0))]
+            visited[y0, x0] = True
+            points: list[tuple[int, int]] = []
+            while stack:
+                y, x = stack.pop()
+                points.append((y, x))
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < height and 0 <= nx < width and work[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            area = len(points)
+            if area < 2 or area > 80:
+                continue
+            ys = np.array([p[0] for p in points])
+            xs = np.array([p[1] for p in points])
+            box_h = int(ys.max() - ys.min() + 1)
+            box_w = int(xs.max() - xs.min() + 1)
+            if box_h > 10 or box_w > 10:
+                continue
+            score = abs(box_h - box_w) + area * 0.03
+            if score < best_score:
+                best_score = score
+                best = (float(xs.mean()), float(ys.mean()))
+        return best
 
 
 class DuelingPongDQN(nn.Module):
@@ -93,6 +264,10 @@ class AgentConfig:
     epsilon_end: float = 0.03
     epsilon_decay_steps: int = 500_000
     reward_clip: float = 1.0
+    heuristic_enabled: bool = True
+    heuristic_train_probability: float = 0.25
+    move_down_action: int = 2
+    move_up_action: int = 3
 
     @classmethod
     def from_dict(cls, values: dict[str, Any] | None) -> "AgentConfig":
@@ -116,7 +291,8 @@ class MyAgent:
         self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=self.config.learning_rate)
         self.replay = ReplayBuffer(self.config.replay_capacity)
         self.frames = self._make_frame_stack()
-        self.training = True
+        self.tracker = VisionTracker(self.config.move_down_action, self.config.move_up_action)
+        self.training = False
         self.steps_done = 0
         self.stats: dict[str, Any] = {"episodes": 0, "best_eval_reward": -math.inf}
 
@@ -137,6 +313,7 @@ class MyAgent:
 
     def reset(self) -> None:
         self.frames = self._make_frame_stack()
+        self.tracker.reset()
 
     def train_mode(self) -> None:
         self.training = True
@@ -153,7 +330,12 @@ class MyAgent:
         if observation is None:
             return self.action_metadata.default_action
         state = self.encode_observation(observation)
-        return self.select_action(state, explore=self.training)
+        tracked = self.tracker.observe(observation)
+        action = self._heuristic_action(tracked)
+        if action is None:
+            action = self.select_action(state, explore=self.training)
+        self.tracker.remember_action(action, tracked)
+        return clamp_action(action, self.config.num_actions)
 
     def encode_observation(self, observation) -> torch.Tensor:
         frame = self._preprocess_frame(observation)
@@ -220,6 +402,13 @@ class MyAgent:
     def update_target(self) -> None:
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
+    def _heuristic_action(self, tracked: VisionObservation) -> int | None:
+        if not self.config.heuristic_enabled:
+            return None
+        if self.training and random.random() > self.config.heuristic_train_probability:
+            return None
+        return self.tracker.choose_action(tracked)
+
     def save(self, path: str | Path) -> None:
         save_checkpoint(
             path,
@@ -248,22 +437,27 @@ class MyAgent:
 
     @staticmethod
     def _preprocess_frame(observation) -> torch.Tensor:
+        gray = MyAgent._observation_to_grayscale(observation)
+        crop = gray[34:194, :] if gray.shape[0] >= 194 else gray
+        image = Image.fromarray(crop.astype(np.uint8), mode="L")
+        image = image.resize((FRAME_SIZE, FRAME_SIZE), Image.Resampling.BILINEAR)
+        values = np.asarray(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(values).unsqueeze(0)
+
+    @staticmethod
+    def _observation_to_grayscale(observation) -> np.ndarray:
         array = np.asarray(observation.detach().cpu().numpy() if isinstance(observation, torch.Tensor) else observation)
         if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
             array = np.moveaxis(array, 0, -1)
         if array.ndim == 3 and array.shape[-1] == 4:
             array = array[..., :3]
         if array.ndim == 3:
-            array = array[34:194, :, :]
             image = Image.fromarray(array.astype(np.uint8), mode="RGB").convert("L")
         elif array.ndim == 2:
-            array = array[34:194, :]
             image = Image.fromarray(array.astype(np.uint8), mode="L")
         else:
             raise ValueError(f"Expected image frame with 2 or 3 dims, got shape {array.shape}")
-        image = image.resize((FRAME_SIZE, FRAME_SIZE), Image.Resampling.BILINEAR)
-        values = np.asarray(image, dtype=np.float32) / 255.0
-        return torch.from_numpy(values).unsqueeze(0)
+        return np.asarray(image, dtype=np.uint8)
 
 
 Agent = MyAgent
