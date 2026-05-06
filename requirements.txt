@@ -1,0 +1,9 @@
+ale-py
+AutoROM.accept-rom-license
+gymnasium
+imageio
+imageio-ffmpeg
+numpy
+pettingzoo[atari]
+pillow
+torch
