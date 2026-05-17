@@ -254,12 +254,12 @@ class DuelingPongDQN(nn.Module):
 class AgentConfig:
     num_actions: int = 6
     frame_stack: int = FRAME_STACK
-    replay_capacity: int = 150_000
-    batch_size: int = 64
+    replay_capacity: int = 100_000
+    batch_size: int = 256
     gamma: float = 0.99
     learning_rate: float = 1e-4
     target_update_interval: int = 2_500
-    min_replay_size: int = 5_000
+    min_replay_size: int = 2_000
     epsilon_start: float = 1.0
     epsilon_end: float = 0.03
     epsilon_decay_steps: int = 500_000
@@ -363,10 +363,10 @@ class MyAgent:
         clipped_reward = float(np.clip(reward, -self.config.reward_clip, self.config.reward_clip))
         self.replay.push(
             Transition(
-                state.detach().cpu(),
+                self._pack_state(state),
                 clamp_action(action, self.config.num_actions),
                 clipped_reward,
-                next_state.detach().cpu(),
+                self._pack_state(next_state),
                 bool(done),
             )
         )
@@ -377,10 +377,10 @@ class MyAgent:
         transitions = self.replay.sample(self.config.batch_size)
         batch = Transition(*zip(*transitions))
 
-        states = torch.stack(batch.state).to(self.device)
+        states = self._unpack_batch(batch.state)
         actions = torch.tensor(batch.action, dtype=torch.long, device=self.device).unsqueeze(1)
         rewards = torch.tensor(batch.reward, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.stack(batch.next_state).to(self.device)
+        next_states = self._unpack_batch(batch.next_state)
         dones = torch.tensor(batch.done, dtype=torch.float32, device=self.device).unsqueeze(1)
 
         q_values = self.policy_net(states).gather(1, actions)
@@ -401,6 +401,13 @@ class MyAgent:
 
     def update_target(self) -> None:
         self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    @staticmethod
+    def _pack_state(state: torch.Tensor) -> torch.Tensor:
+        return (state.detach().clamp(0.0, 1.0).mul(255).to(torch.uint8).cpu())
+
+    def _unpack_batch(self, states: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return torch.stack(states).to(self.device).float().div_(255.0)
 
     def _heuristic_action(self, tracked: VisionObservation) -> int | None:
         if not self.config.heuristic_enabled:

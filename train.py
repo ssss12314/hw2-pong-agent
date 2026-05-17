@@ -5,12 +5,26 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
+
+import torch
 
 from agents.random_agent import RandomAgent
 from pong_framework.actions import clamp_action
 from pong_framework.envs import make_pettingzoo_pong
 from pong_framework.loader import load_agent
+
+
+@dataclass
+class TrainingResult:
+    reward: float
+    env_steps: int
+    optimizes: int
+    mean_loss: float | None
+    elapsed_seconds: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,15 +41,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_episodes", type=int, default=3)
     parser.add_argument("--save_dir", default="checkpoints")
     parser.add_argument("--render", action="store_true")
+    parser.add_argument(
+        "--optimize_steps",
+        type=int,
+        default=1,
+        help="Gradient updates after each collected train transition. Increase to use more GPU.",
+    )
+    parser.add_argument("--batch_size", type=int, default=None, help="Override train agent batch size.")
+    parser.add_argument("--min_replay_size", type=int, default=None, help="Override warmup transitions before updates.")
+    parser.add_argument(
+        "--heuristic_train_probability",
+        type=float,
+        default=None,
+        help="For hybrid agents, probability of using the visual heuristic while training.",
+    )
+    parser.add_argument(
+        "--torch_threads",
+        type=int,
+        default=0,
+        help="PyTorch CPU threads. Use 0 to auto-pick a sensible value for the host CPU.",
+    )
+    parser.add_argument("--latest_interval", type=int, default=25, help="Save latest checkpoint every N episodes.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    torch_threads = _resolve_torch_threads(args.torch_threads)
+    torch.set_num_threads(torch_threads)
+    try:
+        torch.set_num_interop_threads(max(1, min(4, torch_threads)))
+    except RuntimeError:
+        pass
+    print(f"torch_threads={torch.get_num_threads()}")
     train_side = "left" if args.left else "right"
     train_path = args.left or args.right
     train_agent = load_agent(train_path, args.ckpt)
     _require_trainable(train_agent)
+    _configure_agent(train_agent, args)
 
     baseline_agent = _load_baseline(args.baseline, args.baseline_ckpt)
     if hasattr(baseline_agent, "eval_mode"):
@@ -46,8 +89,25 @@ def main() -> None:
     best_reward = float(getattr(train_agent, "stats", {}).get("best_eval_reward", -math.inf))
 
     for episode in range(1, args.episodes + 1):
-        reward = run_training_episode(train_agent, baseline_agent, train_side, args.max_steps, args.render)
-        print(f"episode={episode} train_side={train_side} reward={reward:.2f} epsilon={_epsilon(train_agent):.3f}")
+        result = run_training_episode(
+            train_agent,
+            baseline_agent,
+            train_side,
+            args.max_steps,
+            args.render,
+            max(1, args.optimize_steps),
+        )
+        steps_per_second = result.env_steps / max(result.elapsed_seconds, 1e-9)
+        loss_text = "n/a" if result.mean_loss is None else f"{result.mean_loss:.5f}"
+        print(
+            f"episode={episode} train_side={train_side} reward={result.reward:.2f} "
+            f"epsilon={_epsilon(train_agent):.3f} steps={result.env_steps} "
+            f"ups={result.optimizes} fps={steps_per_second:.1f} loss={loss_text}"
+        )
+        if args.latest_interval > 0 and episode % args.latest_interval == 0:
+            latest_path = save_dir / f"{train_side}_latest.pt"
+            train_agent.save(latest_path)
+            print(f"saved_latest={latest_path}")
 
         if episode % args.eval_interval == 0:
             eval_reward = evaluate(train_agent, baseline_agent, train_side, args.eval_episodes, args.max_steps)
@@ -60,9 +120,20 @@ def main() -> None:
                 print(f"saved={path}")
 
 
-def run_training_episode(train_agent, baseline_agent, train_side: str, max_steps: int, render: bool = False) -> float:
+def run_training_episode(
+    train_agent,
+    baseline_agent,
+    train_side: str,
+    max_steps: int,
+    render: bool = False,
+    optimize_steps: int = 1,
+) -> TrainingResult:
     env = make_pettingzoo_pong(render_mode="human" if render else None)
     total_reward = 0.0
+    env_steps = 0
+    optimizes = 0
+    losses = []
+    started_at = time.perf_counter()
     try:
         env.reset()
         env_agents = list(getattr(env, "possible_agents", env.agents))
@@ -85,6 +156,7 @@ def run_training_episode(train_agent, baseline_agent, train_side: str, max_steps
             done = bool(termination or truncation)
             player = player_for_env[env_agent]
             if env_agent == train_env_agent:
+                env_steps += 1
                 total_reward += float(reward)
                 if observation is not None:
                     state = train_agent.encode_observation(observation)
@@ -92,7 +164,11 @@ def run_training_episode(train_agent, baseline_agent, train_side: str, max_steps
                     state = train_agent.current_state()
                 if last_state is not None and last_action is not None:
                     train_agent.remember(last_state, last_action, reward, state, done)
-                    train_agent.optimize()
+                    for _ in range(optimize_steps):
+                        loss = train_agent.optimize()
+                        if loss is not None:
+                            losses.append(loss)
+                            optimizes += 1
                 if done:
                     env.step(None)
                     last_state = None
@@ -110,7 +186,14 @@ def run_training_episode(train_agent, baseline_agent, train_side: str, max_steps
                 env.step(clamp_action(action, env.action_space(env_agent).n))
     finally:
         env.close()
-    return total_reward
+    mean_loss = sum(losses) / len(losses) if losses else None
+    return TrainingResult(
+        reward=total_reward,
+        env_steps=env_steps,
+        optimizes=optimizes,
+        mean_loss=mean_loss,
+        elapsed_seconds=time.perf_counter() - started_at,
+    )
 
 
 def evaluate(train_agent, baseline_agent, train_side: str, episodes: int, max_steps: int) -> float:
@@ -170,6 +253,31 @@ def _epsilon(agent) -> float:
     return float(getattr(agent, "epsilon", 0.0))
 
 
+def _resolve_torch_threads(value: int) -> int:
+    if value > 0:
+        return value
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(6, cpu_count))
+
+
+def _configure_agent(agent, args: argparse.Namespace) -> None:
+    config = getattr(agent, "config", None)
+    if config is None:
+        return
+    overrides = {
+        "batch_size": args.batch_size,
+        "min_replay_size": args.min_replay_size,
+        "heuristic_train_probability": args.heuristic_train_probability,
+    }
+    changed = []
+    for name, value in overrides.items():
+        if value is None or not hasattr(config, name):
+            continue
+        setattr(config, name, value)
+        changed.append(f"{name}={value}")
+    if changed:
+        print("agent_config_overrides " + " ".join(changed))
+
+
 if __name__ == "__main__":
     main()
-
